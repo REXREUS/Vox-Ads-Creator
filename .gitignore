@@ -1,0 +1,7 @@
+.agents
+.kiro
+instruct
+node_modules
+skills-lock.json
+.gitkeep
+.env
