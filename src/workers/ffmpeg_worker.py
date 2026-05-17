@@ -388,55 +388,61 @@ def process(
         t_out = scene.get("transition_out", "crossfade")
         transition_durations.append(0.1 if t_out == "none" else 0.5)
 
-    # Build xfade chain
+    # ROBUST FIX: Concatenate clips via concat filter (not aconcat), then apply transitions
+    # This avoids all stream mapping issues by pre-concatenating all clips at once
     n = len(normalized)
-    inputs = [ffmpeg.input(p) for p in normalized]
-
+    
     if n == 1:
-        video_stream = inputs[0].video
-        audio_stream = inputs[0].audio.filter("aformat", channel_layouts="stereo")
+        video_stream = ffmpeg.input(normalized[0]).video
+        audio_stream = ffmpeg.input(normalized[0]).audio.filter("aformat", channel_layouts="stereo")
     else:
-        # Build xfade chain programmatically
-        durations = [get_duration(p) for p in normalized]
-        # Log duration mismatches that could cause acrossfade failures
-        for i in range(len(durations) - 1):
-            diff = abs(durations[i] - durations[i+1])
-            if diff > 1.0:
-                logger.warning(f"Duration mismatch scene {i} vs {i+1}: {durations[i]:.2f}s vs {durations[i+1]:.2f}s (diff={diff:.2f}s) - may cause acrossfade issues")
-        offset = 0.0
-        video_stream = inputs[0].video
-        audio_stream = inputs[0].audio.filter("aformat", channel_layouts="stereo")
-
-        for i in range(1, n):
-            td = transition_durations[i - 1]
-            # Clamp transition duration to at most half the shorter of the two clips
-            max_td = min(durations[i - 1], durations[i]) / 2.0
-            td = min(td, max_td) if max_td > 0 else 0.1
-            # acrossfade requires a minimum duration — clamp to at least 0.1s
-            td = max(td, 0.1)
-            # Ensure offset is always positive — xfade will fail with negative offset
-            new_offset = offset + durations[i - 1] - td
-            if new_offset <= offset:
-                # Clip too short for transition — use minimal overlap
-                new_offset = offset + max(durations[i - 1] - 0.1, 0.01)
-                td = 0.1
-            offset = new_offset
-            video_stream = ffmpeg.filter(
-                [video_stream, inputs[i].video],
-                "xfade",
-                transition="fade",
-                duration=td,
-                offset=round(offset, 4),
-            )
-            next_audio = inputs[i].audio.filter("aformat", channel_layouts="stereo")
-            logger.info(f"acrossfade loop {i}: prev_dur={durations[i-1]}, next_dur={durations[i]}, td={td}, offset={round(offset,4)}")
-            audio_stream = ffmpeg.filter(
-                [audio_stream, next_audio],
-                "acrossfade",
-                d=td,
-                c1="tri",
-                c2="tri",
-            )
+        # Step 1: Pre-concatenate ALL clips into single video+audio streams
+        # Using concat filter with v=1,a=1 to merge all inputs cleanly
+        all_video = []
+        all_audio = []
+        for clip_path in normalized:
+            inp = ffmpeg.input(clip_path)
+            all_video.append(inp.video)
+            all_audio.append(inp.audio.filter("aformat", channel_layouts="stereo"))
+        
+        # Concatenate all at once - clean stream mapping
+        if len(all_video) >= 2:
+            # Use concat filter to merge all streams first
+            concat_video = ffmpeg.filter(all_video, "concat", n=len(all_video), v=1, a=0)
+            concat_audio = ffmpeg.filter(all_audio, "concat", n=len(all_audio), v=0, a=1)
+            
+            # Now apply xfade transitions on the concatenated video
+            # Get durations after concatenation
+            durations = [get_duration(p) for p in normalized]
+            
+            # Build xfade chain on pre-concatenated video
+            offset = 0.0
+            video_stream = concat_video
+            
+            for i in range(1, n):
+                td = transition_durations[i - 1]
+                max_td = min(durations[i - 1], durations[i]) / 2.0
+                td = min(td, max_td) if max_td > 0 else 0.1
+                td = max(td, 0.1)
+                new_offset = offset + durations[i - 1] - td
+                if new_offset <= offset:
+                    new_offset = offset + max(durations[i - 1] - 0.1, 0.01)
+                    td = 0.1
+                offset = new_offset
+                video_stream = ffmpeg.filter(
+                    [video_stream, all_video[i]],
+                    "xfade",
+                    transition="fade",
+                    duration=td,
+                    offset=round(offset, 4),
+                )
+            
+            audio_stream = concat_audio
+        else:
+            video_stream = all_video[0]
+            audio_stream = all_audio[0]
+        
+        logger.info(f"Video+Audio concatenation complete via concat filter")
     # Step 4 — optional watermark
     if watermark:
         if not FONT_FILE:
