@@ -70,7 +70,7 @@ def run_ffmpeg(cmd: list[str], retries: int = 2) -> None:
                 cmd,
                 capture_output=True,
                 stdin=subprocess.DEVNULL,
-                timeout=300,  # 5 minute timeout per command
+                timeout=1800,  # 30 minute timeout per command to avoid spurious timeouts
             )
             if result.returncode == 0:
                 return
@@ -79,7 +79,7 @@ def run_ffmpeg(cmd: list[str], retries: int = 2) -> None:
                 logger.warning(f"FFmpeg attempt {attempt + 1} failed, retrying in 1s...")
                 time.sleep(1)
         except subprocess.TimeoutExpired:
-            last_error = "Command timed out after 300 seconds"
+            last_error = "Command timed out after 1800 seconds"
             if attempt < retries:
                 logger.warning(f"FFmpeg attempt {attempt + 1} timed out, retrying...")
         except Exception as e:
@@ -167,6 +167,8 @@ def process(
                 "ffmpeg", "-y", "-nostdin",
                 "-i", clip_path,
                 "-vf", vf,
+                "-map", "0:v",
+                "-map", "0:a",
                 "-c:v", "libx264", "-crf", "20", "-preset", "fast",
                 "-c:a", "aac", "-b:a", "128k",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -179,6 +181,8 @@ def process(
                 "-i", clip_path,
                 "-f", "lavfi", "-t", str(clip_duration), "-i", "anullsrc=r=44100:cl=stereo",
                 "-vf", vf,
+                "-map", "0:v",
+                "-map", "1:a",
                 "-c:v", "libx264", "-crf", "20", "-preset", "fast",
                 "-c:a", "aac", "-b:a", "128k",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -202,7 +206,7 @@ def process(
                 clip_duration = get_duration(norm_path)
                 
                 # Normalize narration to stereo (simple approach, no dynaudnorm to avoid compatibility issues)
-                narr_norm = os.path.join(tmp_dir, f"narr_norm_{idx}.mp3")
+                narr_norm = os.path.join(tmp_dir, f"narr_norm_{idx}.m4a")
                 cmd_norm = [
                     "ffmpeg", "-y", "-nostdin",
                     "-i", narr_path,
@@ -215,11 +219,13 @@ def process(
                 run_ffmpeg(cmd_norm)
                 
                 if is_video_input:
-                    # Replace original audio with narration
+                    # Replace original audio with narration only (explicit map)
                     cmd_merge = [
                         "ffmpeg", "-y", "-nostdin",
                         "-i", norm_path,
                         "-i", narr_norm,
+                        "-map", "0:v",
+                        "-map", "1:a",
                         "-c:v", "copy",
                         "-c:a", "aac", "-b:a", "128k",
                         "-shortest",
@@ -242,10 +248,21 @@ def process(
                 narrated.append(narr_out)
             else:
                 if is_video_input:
-                    # No narration but video input: ensure audio exists (may already have it from normalize)
+                    # No narration for this scene but video input: replace audio with silence
                     silent_out = os.path.join(tmp_dir, f"silent_{idx}.mp4")
-                    if os.path.exists(norm_path):
-                        shutil.copy(norm_path, silent_out)
+                    sil_dur = get_duration(norm_path)
+                    cmd_sil = [
+                        "ffmpeg", "-y", "-nostdin",
+                        "-i", norm_path,
+                        "-f", "lavfi", "-t", str(sil_dur), "-i", "anullsrc=r=44100:cl=stereo",
+                        "-map", "0:v",
+                        "-map", "1:a",
+                        "-c:v", "copy",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-shortest",
+                        silent_out
+                    ]
+                    run_ffmpeg(cmd_sil)
                     narrated.append(silent_out)
                 else:
                     narrated.append(norm_path)
