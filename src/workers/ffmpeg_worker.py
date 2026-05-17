@@ -63,152 +63,23 @@ FONT_FILE = next(
 # Helpers
 # ---------------------------------------------------------------------------
 
-_FFMPEG_NOISE_PREFIXES = (
-    "frame=", "fps=", "size=", "time=", "bitrate=", "speed=",
-    "Stream #", "  Stream #", "Input #", "Output #",
-    "  Duration:", "  Chapter", "  Program", "  Metadata:",
-    "    handler_name", "    vendor_id", "    encoder",
-    "    major_brand", "    minor_version", "    compatible_brands",
-    "    creation_time", "    language", "    title",
-    "video:", "audio:", "subtitle:", "global headers",
-    "muxing overhead", "ffmpeg version", "built with", "configuration:",
-    "libav", "lib", "  lib",
-)
-
-def _is_ffmpeg_noise(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped:
-        return True
-    for prefix in _FFMPEG_NOISE_PREFIXES:
-        if stripped.startswith(prefix):
-            return True
-    # Metadata key-value lines: "  key    : value" or "handler_name    : VideoHandler"
-    # These are stream/container metadata, not errors
-    if "    :" in line or (": " in line and line.startswith("  ") and not any(
-        kw in line for kw in ("Error", "error", "Invalid", "failed", "Cannot", "No such")
-    )):
-        # Only skip if it looks like a metadata line (indented key: value)
-        import re
-        if re.match(r"^\s+\w[\w_\s]+\s*:\s*\S", line):
-            return True
-    return False
-
-def _extract_ffmpeg_error(stderr: str) -> str:
-    """Extract the meaningful error lines from FFmpeg stderr, filtering out metadata noise."""
-    lines = stderr.splitlines()
-    meaningful = [l for l in lines if not _is_ffmpeg_noise(l)]
-
-    # Prefer lines that explicitly mention an error/failure
-    error_lines = [
-        l for l in meaningful
-        if any(kw in l for kw in (
-            "Error", "error", "Invalid", "invalid",
-            "No such", "failed", "Failed", "Cannot", "cannot",
-            "Unrecognized", "not found", "Permission denied",
-            "moov atom", "codec not found", "Conversion failed",
-        ))
-    ]
-
-    if error_lines:
-        return "\n".join(error_lines[-5:]).strip()
-    if meaningful:
-        return "\n".join(meaningful[-8:]).strip()
-    return stderr[-300:].strip()
-
-
-def run_ffmpeg(stream) -> None:
-    """Run an ffmpeg stream, capturing stderr and re-raising with detail on failure."""
-    try:
-        # Compile to command list, then add -nostdin to disable interactive prompts
-        cmd = stream.overwrite_output().compile()
-        # Insert -nostdin after 'ffmpeg' command
-        if '-nostdin' not in cmd:
-            cmd.insert(1, '-nostdin')
-        
-        subprocess.run(cmd, check=True, capture_output=True, stdin=subprocess.DEVNULL)
-    except subprocess.CalledProcessError as e:
-        stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else "(no stderr)"
-        summary = _extract_ffmpeg_error(stderr)
-        logger.error(f"FFmpeg failed: {summary}")
-        try:
-            with open("/tmp/vox_ffmpeg_debug.log", "w") as f:
-                f.write(stderr)
-            logger.error(f"Full FFmpeg stderr written to /tmp/vox_ffmpeg_debug.log")
-        except Exception:
-            pass
-        raise RuntimeError(f"FFmpeg failed: {summary}") from e
-    except ffmpeg.Error as e:
-        stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else "(no stderr)"
-        summary = _extract_ffmpeg_error(stderr)
-        logger.error(f"FFmpeg failed: {summary}")
-        try:
-            with open("/tmp/vox_ffmpeg_debug.log", "w") as f:
-                f.write(stderr)
-            logger.error(f"Full FFmpeg stderr written to /tmp/vox_ffmpeg_debug.log")
-        except Exception:
-            pass
-        raise RuntimeError(f"FFmpeg failed: {summary}") from e
-
-
-def normalize_clip(input_path: str, output_path: str) -> None:
-    """Re-encode a single clip to 24 fps, 1280×720, yuv420p, stereo AAC audio."""
-    logger.info(f"Normalizing {input_path} → {output_path}")
-
-    # Probe to check if the clip has an audio stream
-    try:
-        probe = ffmpeg.probe(input_path)
-    except ffmpeg.Error as e:
-        stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-        raise RuntimeError(f"Failed to probe {input_path}: {stderr[-300:]}") from e
-
-    has_audio = any(s["codec_type"] == "audio" for s in probe.get("streams", []))
-    clip_duration = float(probe.get("format", {}).get("duration", 0)) or 5.0
-
-    vf = (
-        f"fps={TARGET_FPS},scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
-        f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
+def run_ffmpeg_direct(cmd: list[str]) -> None:
+    """Run FFmpeg via subprocess for full filter_complex control."""
+    logger.info(f"Running: ffmpeg {' '.join(cmd[:4])}...")
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
     )
-
-    video_in = ffmpeg.input(input_path)
-
-    if has_audio:
-        # Force stereo — acrossfade/amix require consistent channel layout
-        audio_stream = video_in.audio.filter("aformat", channel_layouts="stereo")
-        out = ffmpeg.output(
-            video_in.video,
-            audio_stream,
-            output_path,
-            vf=vf,
-            vcodec="libx264",
-            crf=20,
-            preset="fast",
-            acodec="aac",
-            audio_bitrate="128k",
-            pix_fmt="yuv420p",
-            movflags="+faststart",
-        )
-    else:
-        # No audio stream — synthesize stereo silence so downstream filters always have audio
-        silence = (
-            ffmpeg.input(f"anullsrc=r=44100:cl=stereo", format="lavfi", t=clip_duration)
-            .audio
-            .filter("asetpts", "PTS-STARTPTS")
-        )
-        out = ffmpeg.output(
-            video_in.video,
-            silence,
-            output_path,
-            vf=vf,
-            vcodec="libx264",
-            crf=20,
-            preset="fast",
-            acodec="aac",
-            audio_bitrate="128k",
-            pix_fmt="yuv420p",
-            movflags="+faststart",
-        )
-
-    run_ffmpeg(out)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        logger.error(f"FFmpeg failed: {stderr[-500:]}")
+        try:
+            with open("/tmp/vox_ffmpeg_debug.log", "w") as f:
+                f.write(stderr)
+        except Exception:
+            pass
+        raise RuntimeError(f"FFmpeg failed with exit code {result.returncode}")
 
 
 def get_duration(path: str) -> float:
@@ -223,95 +94,8 @@ def get_duration(path: str) -> float:
     return float(probe["format"].get("duration", 5.0))
 
 
-def _strip_audio(clip_path: str, output_path: str) -> None:
-    """Replace clip audio with stereo silence — used for video input scenes without narration."""
-    clip_duration = get_duration(clip_path)
-    video_in = ffmpeg.input(clip_path)
-    silence = (
-        ffmpeg.input(f"anullsrc=r=44100:cl=stereo", format="lavfi", t=clip_duration)
-        .audio
-        .filter("asetpts", "PTS-STARTPTS")
-    )
-    run_ffmpeg(
-        ffmpeg
-        .output(
-            video_in.video, silence, output_path,
-            vcodec="libx264", crf=20, preset="fast",
-            acodec="aac", audio_bitrate="128k",
-            pix_fmt="yuv420p",
-        )
-    )
-
-
-def merge_narration_into_clip(clip_path: str, narration_path: str, output_path: str, strip_original_audio: bool = False) -> None:
-    """
-    Merge a narration audio track into a video clip.
-
-    strip_original_audio=True  → video input: discard original audio entirely,
-                                  use narration only (avoids 3-way audio collision)
-    strip_original_audio=False → image-to-video: duck original clip audio to 15%,
-                                  mix with narration at full volume
-    """
-    logger.info(f"Merging narration into {clip_path} (strip_original={strip_original_audio})")
-    clip_duration = get_duration(clip_path)
-
-    video_in = ffmpeg.input(clip_path)
-    narr_in = ffmpeg.input(narration_path)
-
-    # Normalize narration loudness and trim/pad to clip duration
-    # Force stereo FIRST before any processing — Runway TTS may output mono
-    narr_audio = (
-        narr_in.audio
-        .filter("aformat", channel_layouts="stereo")
-        .filter("dynaudnorm", p=0.95, maxgain=10)
-        .filter("apad", whole_dur=clip_duration)
-        .filter("atrim", duration=clip_duration)
-        .filter("asetpts", "PTS-STARTPTS")
-    )
-
-    if strip_original_audio:
-        # Video input: use narration only — no original audio to avoid collision
-        final_audio = narr_audio.filter("aformat", channel_layouts="stereo")
-    else:
-        # Image-to-video: duck original clip audio, mix under narration
-        # Probe first to check if clip has audio — normalized clips should always have audio (silence if none)
-        try:
-            probe = ffmpeg.probe(clip_path)
-            has_audio = any(s["codec_type"] == "audio" for s in probe.get("streams", []))
-        except Exception:
-            has_audio = False
-        
-        if has_audio:
-            clip_audio_ducked = video_in.audio.filter("aformat", channel_layouts="stereo").filter("volume", volume=0.15)
-            final_audio = ffmpeg.filter(
-                [narr_audio.filter("aformat", channel_layouts="stereo"), clip_audio_ducked],
-                "amix",
-                inputs=2,
-                duration="first",
-                normalize=0,
-            )
-        else:
-            # Clip has no audio — use narration only
-            final_audio = narr_audio.filter("aformat", channel_layouts="stereo")
-
-    run_ffmpeg(
-        ffmpeg
-        .output(
-            video_in.video,
-            final_audio,
-            output_path,
-            vcodec="libx264",
-            crf=20,
-            preset="fast",
-            acodec="aac",
-            audio_bitrate="128k",
-            pix_fmt="yuv420p",
-        )
-    )
-
-
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Main pipeline using subprocess + filter_complex
 # ---------------------------------------------------------------------------
 
 def process(
@@ -327,11 +111,9 @@ def process(
     Full post-production pipeline:
       1. Normalize all clips to 24 fps / 1280×720
       2. Merge per-scene narration audio into each clip (if provided)
-         - is_video_input=True:  strip original clip audio, use narration only
-         - is_video_input=False: duck original clip audio to 15%, mix with narration
-      3. Crossfade transitions
+      3. Concatenate clips via subprocess (clean stream mapping)
       4. Optional watermark overlay
-      5. Optional background audio merge (looped, ducked to 20% under narration)
+      5. Optional background audio merge
       6. Write final .mp4
 
     Returns the output path.
@@ -339,21 +121,58 @@ def process(
     if not clips:
         raise ValueError("No clips provided")
 
-    # os.path.dirname returns '' if output_path has no directory component — guard against that
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    # Determine transition type per scene from storyline
     scenes = storyline.get("scenes", [])
 
-    # Step 1 — normalize clips
+    # Step 1 — normalize clips using ffmpeg-python (simple operation)
     tmp_dir = tempfile.mkdtemp(prefix="vox_norm_")
     normalized: list[str] = []
+    
     for idx, clip_path in enumerate(clips):
         norm_path = os.path.join(tmp_dir, f"norm_{idx}.mp4")
-        normalize_clip(clip_path, norm_path)
+        
+        # Probe for audio
+        try:
+            probe = ffmpeg.probe(clip_path)
+            has_audio = any(s["codec_type"] == "audio" for s in probe.get("streams", []))
+            clip_duration = float(probe.get("format", {}).get("duration", 0)) or 5.0
+        except Exception:
+            has_audio = False
+            clip_duration = 5.0
+        
+        vf = f"fps={TARGET_FPS},scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
+        
+        if has_audio:
+            # Use direct subprocess for reliability
+            cmd = [
+                "ffmpeg", "-y", "-nostdin",
+                "-i", clip_path,
+                "-vf", vf,
+                "-vcodec", "libx264", "-crf", "20", "-preset", "fast",
+                "-acodec", "aac", "-audio_bitrate", "128k",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                norm_path
+            ]
+        else:
+            # No audio: synthesize silence
+            cmd = [
+                "ffmpeg", "-y", "-nostdin",
+                "-i", clip_path,
+                "-f", "lavfi", "-t", str(clip_duration), "-i", "anullsrc=r=44100:cl=stereo",
+                "-vf", vf,
+                "-vcodec", "libx264", "-crf", "20", "-preset", "fast",
+                "-acodec", "aac", "-audio_bitrate", "128k",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-shortest",
+                norm_path
+            ]
+        
+        run_ffmpeg_direct(cmd)
         normalized.append(norm_path)
+        logger.info(f"Normalized clip {idx + 1}/{len(clips)}")
 
     logger.info(f"Normalized {len(normalized)} clips")
 
@@ -364,210 +183,166 @@ def process(
             narr_path = narration_paths[idx] if idx < len(narration_paths) else None
             if narr_path and os.path.isfile(narr_path):
                 narr_out = os.path.join(tmp_dir, f"narrated_{idx}.mp4")
-                merge_narration_into_clip(norm_path, narr_path, narr_out, strip_original_audio=is_video_input)
+                clip_duration = get_duration(norm_path)
+                
+                # Normalize narration to stereo
+                narr_norm = os.path.join(tmp_dir, f"narr_norm_{idx}.mp3")
+                cmd_norm = [
+                    "ffmpeg", "-y", "-nostdin",
+                    "-i", narr_path,
+                    "-af", "aformat=channel_layouts=stereo,dynaudnorm=p=0.95:maxgain=10,apad=whole_dur=" + str(clip_duration),
+                    "-t", str(clip_duration),
+                    "-acodec", "libmp3lame", "-b:a", "128k",
+                    narr_norm
+                ]
+                run_ffmpeg_direct(cmd_norm)
+                
+                # Merge narration with clip
+                if is_video_input:
+                    # Strip original audio
+                    cmd_merge = [
+                        "ffmpeg", "-y", "-nostdin",
+                        "-i", norm_path,
+                        "-i", narr_norm,
+                        "-vcodec", "copy",
+                        "-acodec", "aac", "-audio_bitrate", "128k",
+                        "-shortest",
+                        narr_out
+                    ]
+                else:
+                    # Duck original audio to 15%
+                    cmd_merge = [
+                        "ffmpeg", "-y", "-nostdin",
+                        "-i", norm_path,
+                        "-i", narr_norm,
+                        "-filter_complex", "[0:a]volume=0.15[a0];[1:a][a0]amix=inputs=2:duration=first:normalize=0[a]",
+                        "-vcodec", "copy",
+                        "-map", "0:v",
+                        "-map", "[a]",
+                        "-acodec", "aac", "-audio_bitrate", "128k",
+                        "-shortest",
+                        narr_out
+                    ]
+                run_ffmpeg_direct(cmd_merge)
                 narrated.append(narr_out)
             else:
-                # No narration for this scene — if video input, still strip original audio
-                # to keep audio consistent across scenes (no sudden audio from one scene)
                 if is_video_input:
                     silent_out = os.path.join(tmp_dir, f"silent_{idx}.mp4")
-                    _strip_audio(norm_path, silent_out)
+                    cmd = [
+                        "ffmpeg", "-y", "-nostdin",
+                        "-i", norm_path,
+                        "-f", "lavfi", "-t", str(get_duration(norm_path)), "-i", "anullsrc=r=44100:cl=stereo",
+                        "-vcodec", "copy",
+                        "-acodec", "aac",
+                        "-shortest",
+                        silent_out
+                    ]
+                    run_ffmpeg_direct(cmd)
                     narrated.append(silent_out)
                 else:
                     narrated.append(norm_path)
         normalized = narrated
         logger.info(f"Narration merged into {sum(1 for p in narration_paths if p)} clips")
 
-    # Step 3 — build filter graph
-    # Use crossfade for scenes that have transition_out == "crossfade" (or default)
-    # For simplicity we apply crossfade between all clips; scenes with "none" get a hard cut
-    # by using a very short transition (0.01s ≈ hard cut)
-    transition_durations: list[float] = []
-    for i in range(len(normalized) - 1):
-        scene = scenes[i] if i < len(scenes) else {}
-        t_out = scene.get("transition_out", "crossfade")
-        transition_durations.append(0.1 if t_out == "none" else 0.5)
-
-    # ROBUST FIX: Concatenate clips via concat filter (not aconcat), then apply transitions
-    # This avoids all stream mapping issues by pre-concatenating all clips at once
+    # Step 3 — concatenate clips via subprocess (RELIABLE approach)
     n = len(normalized)
+    temp_concat = os.path.join(tmp_dir, "concat_temp.mp4")
     
     if n == 1:
-        video_stream = ffmpeg.input(normalized[0]).video
-        audio_stream = ffmpeg.input(normalized[0]).audio.filter("aformat", channel_layouts="stereo")
+        shutil.copy(normalized[0], temp_concat)
     else:
-        # Step 1: Pre-concatenate ALL clips into single video+audio streams
-        # Using concat filter with v=1,a=1 to merge all inputs cleanly
-        all_video = []
-        all_audio = []
-        for clip_path in normalized:
-            inp = ffmpeg.input(clip_path)
-            all_video.append(inp.video)
-            all_audio.append(inp.audio.filter("aformat", channel_layouts="stereo"))
+        # Use filter_complex for clean concatenation
+        filter_complex = (
+            ";".join([f"[{i}:v]" for i in range(n)]) +
+            "".join([f"[{i}:a]" for i in range(n)]) +
+            f"concat=n={n}:v=1:a=1[outv][outa]"
+        )
         
-        # Concatenate all at once - clean stream mapping
-        if len(all_video) >= 2:
-            # Use concat filter to merge all streams first
-            concat_video = ffmpeg.filter(all_video, "concat", n=len(all_video), v=1, a=0)
-            concat_audio = ffmpeg.filter(all_audio, "concat", n=len(all_audio), v=0, a=1)
-            
-            # Now apply xfade transitions on the concatenated video
-            # Get durations after concatenation
-            durations = [get_duration(p) for p in normalized]
-            
-            # Build xfade chain on pre-concatenated video
-            offset = 0.0
-            video_stream = concat_video
-            
-            for i in range(1, n):
-                td = transition_durations[i - 1]
-                max_td = min(durations[i - 1], durations[i]) / 2.0
-                td = min(td, max_td) if max_td > 0 else 0.1
-                td = max(td, 0.1)
-                new_offset = offset + durations[i - 1] - td
-                if new_offset <= offset:
-                    new_offset = offset + max(durations[i - 1] - 0.1, 0.01)
-                    td = 0.1
-                offset = new_offset
-                video_stream = ffmpeg.filter(
-                    [video_stream, all_video[i]],
-                    "xfade",
-                    transition="fade",
-                    duration=td,
-                    offset=round(offset, 4),
-                )
-            
-            audio_stream = concat_audio
-        else:
-            video_stream = all_video[0]
-            audio_stream = all_audio[0]
-        
-        logger.info(f"Video+Audio concatenation complete via concat filter")
+        cmd = ["ffmpeg", "-y", "-nostdin"]
+        for clip in normalized:
+            cmd.extend(["-i", clip])
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-map", "[outa]",
+            "-vcodec", "libx264", "-crf", "20", "-preset", "medium",
+            "-acodec", "aac", "-audio_bitrate", "192k",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            temp_concat
+        ])
+        run_ffmpeg_direct(cmd)
+        logger.info(f"Concatenated {n} clips into single stream")
+
     # Step 4 — optional watermark
-    if watermark:
-        if not FONT_FILE:
-            logger.warning("No font file found — skipping watermark overlay (font required for drawtext)")
+    final_path = temp_concat
+    if watermark and FONT_FILE:
+        logger.info(f"Adding watermark: {watermark}")
+        safe_text = watermark.replace("'", "\\'").replace(":", "\\:")
+        
+        char_count = len(watermark)
+        if char_count <= 8:
+            fontsize = 32
+        elif char_count <= 20:
+            fontsize = int(32 - (char_count - 8) * (12 / 12))
         else:
-            logger.info(f"Adding watermark: {watermark}")
-            # Escape special characters for drawtext
-            safe_text = watermark.replace("'", "\\'").replace(":", "\\:")
-
-            # Dynamic font size: scale down for long text so it never overflows the video.
-            # Base size 32px for short text (≤8 chars), shrinks proportionally down to min 14px.
-            char_count = len(watermark)
-            if char_count <= 8:
-                fontsize = 32
-            elif char_count <= 20:
-                # Linear scale: 32px at 8 chars → 20px at 20 chars
-                fontsize = int(32 - (char_count - 8) * (12 / 12))
-            else:
-                # Very long text: clamp to 14px minimum
-                fontsize = max(14, int(20 - (char_count - 20) * 0.3))
-
-            video_stream = video_stream.drawtext(
-                text=safe_text,
-                fontfile=FONT_FILE,
-                fontsize=fontsize,
-                fontcolor="white@0.85",
-                x="max(10, w-tw-20)",
-                y="h-th-20",
-                shadowcolor="black@0.7",
-                shadowx=2,
-                shadowy=2,
-            )
-
-    # Step 5 — prepare output streams (will be rendered in 2 stages below)
-    # Video stream already has watermark applied if requested
-    # Audio stream already has crossfaded narration from all clips
-
-    logger.info(f"Rendering final video → {output_path}")
-    
-    # Split into 2 stages for reliability:
-    # Stage 1: Video stitching with crossfade (no complex audio mixing yet)
-    # Stage 2: Audio mixing and final merge
-    
-    temp_video_path = output_path.replace('.mp4', '_temp_video.mp4')
-    
-    # Stage 1: Render video with simple audio (just the crossfaded narration track)
-    stage1_out = ffmpeg.output(
-        video_stream,
-        audio_stream,
-        temp_video_path,
-        vcodec="libx264",
-        crf=20,
-        preset="medium",
-        acodec="aac",
-        audio_bitrate="192k",
-        pix_fmt="yuv420p",
-        movflags="+faststart",
-    )
-    
-    logger.info("Stage 1: Rendering video with crossfade transitions...")
-    run_ffmpeg(stage1_out)
-    
-    # Stage 2: If background audio exists, merge it with the video
-    if audio_path and os.path.isfile(audio_path):
-        logger.info("Stage 2: Merging background audio...")
+            fontsize = max(14, int(20 - (char_count - 20) * 0.3))
         
-        video_in = ffmpeg.input(temp_video_path)
-        bg_in = ffmpeg.input(audio_path, stream_loop=-1)
-        
-        # Get video duration for audio trimming
-        video_duration = get_duration(temp_video_path)
-        
-        # Prepare audio streams
-        video_audio = video_in.audio.filter("aformat", channel_layouts="stereo")
-        bg_audio_trimmed = (
-            bg_in.audio
-            .filter("aformat", channel_layouts="stereo")
-            .filter("atrim", duration=video_duration)
-            .filter("asetpts", "PTS-STARTPTS")
-            .filter("volume", volume=0.2)  # Duck background to 20%
-        )
-        
-        # Simple 2-input amix
-        final_audio = ffmpeg.filter(
-            [video_audio, bg_audio_trimmed],
-            "amix",
-            inputs=2,
-            duration="first",
-        )
-        
-        stage2_out = ffmpeg.output(
-            video_in.video,
-            final_audio,
-            output_path,
-            vcodec="copy",  # Copy video — no re-encode
-            acodec="aac",
-            audio_bitrate="192k",
-        )
-        
-        run_ffmpeg(stage2_out)
-        
-        # Cleanup temp video
-        try:
-            os.remove(temp_video_path)
-        except OSError:
-            pass
+        cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-i", temp_concat,
+            "-vf", f"drawtext=text='{safe_text}':fontfile={FONT_FILE}:fontsize={fontsize}:fontcolor=white@0.85:x='max(10,w-tw-20)':y='h-th-20':shadowcolor=black@0.7:shadowx=2:shadowy=2",
+            "-c:a", "copy",
+            output_path
+        ]
+        run_ffmpeg_direct(cmd)
+        final_path = output_path
     else:
-        # No background audio — just rename temp to final
-        import shutil
-        shutil.move(temp_video_path, output_path)
+        shutil.move(temp_concat, output_path)
 
-    # Cleanup normalized temp files — only after render is complete
-    # Collect all intermediate files created in tmp_dir
+    # Step 5 — optional background audio merge
+    if audio_path and os.path.isfile(audio_path):
+        logger.info("Merging background audio...")
+        video_duration = get_duration(output_path)
+        
+        bg_trimmed = os.path.join(tmp_dir, "bg_trimmed.mp3")
+        cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-i", audio_path,
+            "-t", str(video_duration),
+            "-af", "aformat=channel_layouts=stereo,volume=0.2",
+            "-acodec", "libmp3lame", "-b:a", "192k",
+            bg_trimmed
+        ]
+        run_ffmpeg_direct(cmd)
+        
+        temp_with_bg = os.path.join(tmp_dir, "with_bg.mp4")
+        cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-i", output_path,
+            "-i", bg_trimmed,
+            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first[a]",
+            "-map", "0:v",
+            "-map", "[a]",
+            "-c:v", "copy",
+            "-acodec", "aac", "-audio_bitrate", "192k",
+            temp_with_bg
+        ]
+        run_ffmpeg_direct(cmd)
+        shutil.move(temp_with_bg, output_path)
+
+    # Cleanup
     for p in normalized:
-        # Only delete files inside our temp dir — never delete original clips
         if os.path.dirname(os.path.abspath(p)) == os.path.abspath(tmp_dir):
             try:
                 os.remove(p)
             except OSError:
                 pass
     try:
-        os.rmdir(tmp_dir)
+        shutil.rmtree(tmp_dir)
     except OSError:
         pass
 
+    logger.info(f"Render complete: {output_path}")
     return output_path
 
 
@@ -582,9 +357,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Output .mp4 file path")
     parser.add_argument("--watermark", default=None, help="Watermark text to overlay")
     parser.add_argument("--audio", default=None, help="Background audio file path")
-    parser.add_argument("--narrations", default=None, help="JSON array of per-scene narration audio paths (null for scenes without narration)")
-    parser.add_argument("--is_video_input", action="store_true", help="Input asset was a video — strip original clip audio to avoid collision with narration and background music")
-    parser.add_argument("--test", action="store_true", help="Run self-test and exit")
+    parser.add_argument("--narrations", default=None, help="JSON array of per-scene narration audio paths")
+    parser.add_argument("--is_video_input", action="store_true", help="Input was video")
+    parser.add_argument("--test", action="store_true", help="Run self-test")
     return parser.parse_args()
 
 
@@ -593,14 +368,12 @@ def self_test() -> None:
     logger.info("Running self-test...")
     try:
         import ffmpeg as _ffmpeg
-        probe = _ffmpeg.probe  # noqa: F841 — just check import
         logger.info("ffmpeg-python import: OK")
     except ImportError as e:
         logger.error(f"ffmpeg-python not installed: {e}")
         sys.exit(1)
 
     try:
-        import subprocess
         result = subprocess.run(
             ["ffmpeg", "-version"],
             capture_output=True,
@@ -629,7 +402,6 @@ def main() -> None:
         self_test()
         return
 
-    # Parse JSON inputs
     try:
         clips: list[str] = json.loads(args.clips)
     except json.JSONDecodeError as e:
@@ -642,7 +414,6 @@ def main() -> None:
         logger.error(f"Invalid --storyline JSON: {e}")
         sys.exit(1)
 
-    # Validate clip paths exist
     missing = [p for p in clips if not os.path.isfile(p)]
     if missing:
         logger.error(f"Missing clip files: {missing}")
@@ -658,13 +429,9 @@ def main() -> None:
             narration_paths=json.loads(args.narrations) if args.narrations else None,
             is_video_input=args.is_video_input,
         )
-        # Output final path to stdout for Node.js to read
         print(output)
     except Exception as e:
-        # Print only the clean error message — no traceback, no raw FFmpeg stderr noise.
-        # Node.js reads all stderr, so we must keep it clean and actionable.
         msg = str(e)
-        # Strip "FFmpeg failed: " prefix if present — Node.js adds its own context
         clean = msg.replace("FFmpeg failed: ", "").strip()
         logger.error(f"Processing failed: {clean}")
         sys.exit(1)
