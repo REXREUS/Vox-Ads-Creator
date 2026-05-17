@@ -160,7 +160,7 @@ def process(
         norm_path = os.path.join(tmp_dir, f"norm_{idx}.mp4")
         has_audio, clip_duration = probe_clip(clip_path)
         
-        vf = f"fps={TARGET_FPS},scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
+        vf = f"fps={TARGET_FPS},scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
         
         if has_audio:
             cmd = [
@@ -171,6 +171,7 @@ def process(
                 "-map", "0:a",
                 "-c:v", "libx264", "-crf", "20", "-preset", "fast",
                 "-c:a", "aac", "-b:a", "128k",
+                "-ar", "44100", "-ac", "2",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                 norm_path
             ]
@@ -185,6 +186,7 @@ def process(
                 "-map", "1:a",
                 "-c:v", "libx264", "-crf", "20", "-preset", "fast",
                 "-c:a", "aac", "-b:a", "128k",
+                "-ar", "44100", "-ac", "2",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                 "-shortest",
                 norm_path
@@ -228,6 +230,7 @@ def process(
                         "-map", "1:a",
                         "-c:v", "copy",
                         "-c:a", "aac", "-b:a", "128k",
+                        "-ar", "44100", "-ac", "2",
                         "-shortest",
                         narr_out
                     ]
@@ -237,11 +240,12 @@ def process(
                         "ffmpeg", "-y", "-nostdin",
                         "-i", norm_path,
                         "-i", narr_norm,
-                        "-filter_complex", "[0:a]volume=0.2[bg];[1:a][bg]amix=inputs=2:duration=first:normalize=0[mixed]",
+                        "-filter_complex", "[0:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=0.2[bg];[1:a]aformat=sample_rates=44100:channel_layouts=stereo[narr];[narr][bg]amix=inputs=2:duration=first:normalize=0[mixed]",
                         "-map", "0:v",
                         "-map", "[mixed]",
                         "-c:v", "copy",
                         "-c:a", "aac", "-b:a", "128k",
+                        "-ar", "44100", "-ac", "2",
                         narr_out
                     ]
                 run_ffmpeg(cmd_merge)
@@ -259,6 +263,7 @@ def process(
                         "-map", "1:a",
                         "-c:v", "copy",
                         "-c:a", "aac", "-b:a", "128k",
+                        "-ar", "44100", "-ac", "2",
                         "-shortest",
                         silent_out
                     ]
@@ -353,11 +358,12 @@ def process(
             "ffmpeg", "-y", "-nostdin",
             "-i", output_path,
             "-i", bg_trimmed,
-            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[mixed]",
+            "-filter_complex", "[0:a]aformat=sample_rates=44100:channel_layouts=stereo[a0];[1:a]aformat=sample_rates=44100:channel_layouts=stereo[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[mixed]",
             "-map", "0:v",
             "-map", "[mixed]",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
+            "-ar", "44100", "-ac", "2",
             temp_with_bg
         ]
         run_ffmpeg(cmd)
