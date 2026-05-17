@@ -278,9 +278,10 @@ def process(
         logger.info("Single clip, no concatenation needed")
     else:
         # Build filter_complex for concatenation
+        # IMPORTANT: concat filter requires INTERLEAVED order: [v0][a0][v1][a1]...[vN][aN]
+        # NOT grouped: [v0][v1]...[a0][a1]...
         filter_complex = (
-            "".join([f"[{i}:v]" for i in range(n)]) +
-            "".join([f"[{i}:a]" for i in range(n)]) +
+            "".join([f"[{i}:v][{i}:a]" for i in range(n)]) +
             f"concat=n={n}:v=1:a=1[outv][outa]"
         )
         
