@@ -141,7 +141,7 @@ export async function stitchScenes(scenePaths, storyline, options = {}) {
         return;
       }
 
-      const resultPath = stdout.trim().split('\n').pop()?.trim() ?? '';
+      let resultPath = stdout.trim().split('\n').pop()?.trim() ?? '';
       if (!resultPath) {
         reject(new Error('ffmpeg_worker.py produced no output path'));
         return;
@@ -149,6 +149,52 @@ export async function stitchScenes(scenePaths, storyline, options = {}) {
       if (!resultPath.endsWith('.mp4')) {
         reject(new Error(`ffmpeg_worker.py returned unexpected output: ${resultPath.slice(0, 200)}`));
         return;
+      }
+
+      // Check file size and re-compress if it exceeds Discord's 25MB limit (using 24MB for safety)
+      try {
+        const { stat } = await import('fs/promises');
+        const fileStats = await stat(resultPath);
+        const MAX_SIZE = 24 * 1024 * 1024; // 24 MB
+
+        if (fileStats.size > MAX_SIZE) {
+          console.log(`[outputManager] Video size (${(fileStats.size / 1024 / 1024).toFixed(1)}MB) exceeds 24MB limit. Re-compressing...`);
+          
+          const compressedPath = resultPath.replace('.mp4', '_compressed.mp4');
+          
+          // Calculate required bitrate for target size (24MB = 196608 kilobits)
+          // Average duration 30-60s. Let's just use CRF 32 which is highly compressed.
+          const compressArgs = [
+            '-y', '-nostdin',
+            '-i', resultPath,
+            '-c:v', 'libx264',
+            '-crf', '32',
+            '-preset', 'fast',
+            '-c:a', 'aac',
+            '-b:a', '96k',
+            compressedPath
+          ];
+
+          const ffmpegProcess = spawn('ffmpeg', compressArgs);
+          await new Promise((res, rej) => {
+            ffmpegProcess.on('close', (c) => {
+              if (c === 0) res();
+              else rej(new Error(`FFmpeg re-compression exited with code ${c}`));
+            });
+            ffmpegProcess.on('error', rej);
+          });
+
+          // Verify new size
+          const newStats = await stat(compressedPath);
+          console.log(`[outputManager] Compressed video size: ${(newStats.size / 1024 / 1024).toFixed(1)}MB`);
+          
+          // Replace original with compressed
+          const { rename, unlink } = await import('fs/promises');
+          await unlink(resultPath).catch(() => {});
+          await rename(compressedPath, resultPath);
+        }
+      } catch (err) {
+        console.warn(`[outputManager] Failed during final compression check: ${err.message}`);
       }
 
       resolve(resultPath);

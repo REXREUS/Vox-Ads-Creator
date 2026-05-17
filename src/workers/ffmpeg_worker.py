@@ -175,6 +175,8 @@ def process(
             f"setsar=1"
         )
 
+        # Use CRF 28 to compress output heavily and avoid Discord's 25MB attachment limit
+        # (CRF 20 often yields files > 30MB for 30 seconds of HD video)
         if has_audio:
             cmd = [
                 "ffmpeg", "-y", "-nostdin",
@@ -182,7 +184,7 @@ def process(
                 "-vf", vf,
                 "-map", "0:v:0",  # explicitly select first video stream
                 "-map", "0:a:0",  # explicitly select first audio stream
-                "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+                "-c:v", "libx264", "-crf", "28", "-preset", "medium",
                 "-c:a", "aac", "-b:a", "128k",
                 "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
                 "-pix_fmt", "yuv420p",
@@ -199,7 +201,7 @@ def process(
                 "-vf", vf,
                 "-map", "0:v:0",
                 "-map", "1:a",
-                "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+                "-c:v", "libx264", "-crf", "28", "-preset", "medium",
                 "-c:a", "aac", "-b:a", "128k",
                 "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
                 "-pix_fmt", "yuv420p",
@@ -357,6 +359,8 @@ def process(
                 f":shadowcolor=black@0.7"
                 f":shadowx=2:shadowy=2"
             ),
+            "-c:v", "libx264", "-crf", "28", "-preset", "medium",
+            "-pix_fmt", "yuv420p",
             "-c:a", "copy",
             output_path
         ]
