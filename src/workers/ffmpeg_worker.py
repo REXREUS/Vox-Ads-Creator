@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 TARGET_FPS = 24
 TARGET_WIDTH = 1280
 TARGET_HEIGHT = 720
+# All normalized clips must share identical audio properties for demuxer concat to work.
+AUDIO_SAMPLE_RATE = 44100
+AUDIO_CHANNELS = 2  # stereo
 
 # DejaVu Sans is installed via fonts-dejavu-core (Dockerfile) or available in most Linux envs.
 _DEJAVU_PATHS = [
@@ -48,7 +51,6 @@ _DEJAVU_PATHS = [
 _WINDOWS_FONT_PATHS = [
     "C:/Windows/Fonts/arialbd.ttf",
     "C:/Windows/Fonts/arial.ttf",
-    "C:/Windows/Fonts/calibrib.ttf",
     "C:/Windows/Fonts/verdana.ttf",
 ]
 FONT_FILE = next(
@@ -70,7 +72,7 @@ def run_ffmpeg(cmd: list[str], retries: int = 2) -> None:
                 cmd,
                 capture_output=True,
                 stdin=subprocess.DEVNULL,
-                timeout=1800,  # 30 minute timeout per command to avoid spurious timeouts
+                timeout=1800,  # 30 minute timeout per command
             )
             if result.returncode == 0:
                 return
@@ -86,9 +88,10 @@ def run_ffmpeg(cmd: list[str], retries: int = 2) -> None:
             last_error = str(e)
             if attempt < retries:
                 logger.warning(f"FFmpeg attempt {attempt + 1} error: {e}, retrying...")
-    
+
     # All retries failed
-    logger.error(f"FFmpeg failed after {retries + 1} attempts: {last_error[-500:] if last_error else 'unknown error'}")
+    stderr_summary = last_error[-500:] if last_error else "unknown error"
+    logger.error(f"FFmpeg failed after {retries + 1} attempts: {stderr_summary}")
     try:
         with open("/tmp/vox_ffmpeg_debug.log", "w") as f:
             f.write(last_error or "No error message")
@@ -136,12 +139,15 @@ def process(
 ) -> str:
     """
     Full post-production pipeline:
-      1. Normalize all clips to 24 fps / 1280×720
+      1. Normalize all clips to identical format (24fps, 1280x720, AAC 44100Hz stereo)
       2. Merge per-scene narration audio into each clip (if provided)
-      3. Concatenate clips
+      3. Concatenate clips using demuxer concat (fast, stream-copy, ultra-robust)
       4. Optional watermark overlay
       5. Optional background audio merge
       6. Write final .mp4
+
+    Uses demuxer concat (-f concat -safe 0) instead of filter_complex concat
+    to avoid FFmpeg filtergraph stream parameter strictness.
     """
     if not clips:
         raise ValueError("No clips provided")
@@ -150,55 +156,65 @@ def process(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    scenes = storyline.get("scenes", [])
-
-    # Step 1 — normalize clips
+    # Step 1 — normalize all clips to identical codec parameters
+    # This is the critical step: ALL output files must have IDENTICAL:
+    # - Video: H.264, 24fps, 1280x720, yuv420p, SAR=1:1
+    # - Audio: AAC, 44100Hz, stereo (2 channels)
     tmp_dir = tempfile.mkdtemp(prefix="vox_norm_")
     normalized: list[str] = []
-    
+
     for idx, clip_path in enumerate(clips):
         norm_path = os.path.join(tmp_dir, f"norm_{idx}.mp4")
         has_audio, clip_duration = probe_clip(clip_path)
-        
-        vf = f"fps={TARGET_FPS},scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-        
+
+        # Video filter: normalize fps, scale, pad, and FORCE square pixels (SAR=1:1)
+        vf = (
+            f"fps={TARGET_FPS},"
+            f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1"
+        )
+
         if has_audio:
             cmd = [
                 "ffmpeg", "-y", "-nostdin",
                 "-i", clip_path,
                 "-vf", vf,
-                "-map", "0:v",
-                "-map", "0:a",
+                "-map", "0:v:0",  # explicitly select first video stream
+                "-map", "0:a:0",  # explicitly select first audio stream
                 "-c:v", "libx264", "-crf", "20", "-preset", "fast",
                 "-c:a", "aac", "-b:a", "128k",
-                "-ar", "44100", "-ac", "2",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
                 norm_path
             ]
         else:
-            # No audio stream: add silent audio track
+            # No audio stream: synthesize identical silence
             cmd = [
                 "ffmpeg", "-y", "-nostdin",
                 "-i", clip_path,
-                "-f", "lavfi", "-t", str(clip_duration), "-i", "anullsrc=r=44100:cl=stereo",
+                "-f", "lavfi", "-t", str(clip_duration),
+                "-i", f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=stereo",
                 "-vf", vf,
-                "-map", "0:v",
+                "-map", "0:v:0",
                 "-map", "1:a",
                 "-c:v", "libx264", "-crf", "20", "-preset", "fast",
                 "-c:a", "aac", "-b:a", "128k",
-                "-ar", "44100", "-ac", "2",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
                 "-shortest",
                 norm_path
             ]
-        
+
         run_ffmpeg(cmd)
         normalized.append(norm_path)
         logger.info(f"Normalized clip {idx + 1}/{len(clips)}")
 
     logger.info(f"Normalized {len(normalized)} clips")
 
-    # Step 2 — merge per-scene narration
+    # Step 2 — merge per-scene narration into each normalized clip
     if narration_paths:
         narrated: list[str] = []
         for idx, norm_path in enumerate(normalized):
@@ -206,111 +222,120 @@ def process(
             if narr_path and os.path.isfile(narr_path):
                 narr_out = os.path.join(tmp_dir, f"narrated_{idx}.mp4")
                 clip_duration = get_duration(norm_path)
-                
-                # Normalize narration to stereo (simple approach, no dynaudnorm to avoid compatibility issues)
+
+                # Normalize narration audio to consistent format (m4a with AAC)
                 narr_norm = os.path.join(tmp_dir, f"narr_norm_{idx}.m4a")
                 cmd_norm = [
                     "ffmpeg", "-y", "-nostdin",
                     "-i", narr_path,
-                    "-af", f"aformat=channel_layouts=stereo,volume=1.5",
+                    "-af", f"aformat=sample_rates={AUDIO_SAMPLE_RATE}:channel_layouts=stereo,volume=1.5",
                     "-t", str(clip_duration),
                     "-c:a", "aac", "-b:a", "128k",
-                    "-ar", "44100",
+                    "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
                     narr_norm
                 ]
                 run_ffmpeg(cmd_norm)
-                
+
                 if is_video_input:
-                    # Replace original audio with narration only (explicit map)
+                    # Video input: replace clip audio entirely with narration
                     cmd_merge = [
                         "ffmpeg", "-y", "-nostdin",
                         "-i", norm_path,
                         "-i", narr_norm,
-                        "-map", "0:v",
-                        "-map", "1:a",
+                        "-map", "0:v:0",
+                        "-map", "1:a:0",
                         "-c:v", "copy",
                         "-c:a", "aac", "-b:a", "128k",
-                        "-ar", "44100", "-ac", "2",
+                        "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
                         "-shortest",
                         narr_out
                     ]
                 else:
-                    # Mix narration with original audio (duck original)
+                    # Image-to-video: duck original clip audio, mix with narration
+                    af = (
+                        f"[0:a]aformat=sample_rates={AUDIO_SAMPLE_RATE}:channel_layouts=stereo,"
+                        f"volume=0.2[bg];"
+                        f"[1:a]aformat=sample_rates={AUDIO_SAMPLE_RATE}:channel_layouts=stereo[narr];"
+                        f"[narr][bg]amix=inputs=2:duration=first:normalize=0[mixed]"
+                    )
                     cmd_merge = [
                         "ffmpeg", "-y", "-nostdin",
                         "-i", norm_path,
                         "-i", narr_norm,
-                        "-filter_complex", "[0:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=0.2[bg];[1:a]aformat=sample_rates=44100:channel_layouts=stereo[narr];[narr][bg]amix=inputs=2:duration=first:normalize=0[mixed]",
-                        "-map", "0:v",
+                        "-filter_complex", af,
+                        "-map", "0:v:0",
                         "-map", "[mixed]",
                         "-c:v", "copy",
                         "-c:a", "aac", "-b:a", "128k",
-                        "-ar", "44100", "-ac", "2",
+                        "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
                         narr_out
                     ]
                 run_ffmpeg(cmd_merge)
                 narrated.append(narr_out)
             else:
                 if is_video_input:
-                    # No narration for this scene but video input: replace audio with silence
+                    # Video input, no narration: replace audio with silence
                     silent_out = os.path.join(tmp_dir, f"silent_{idx}.mp4")
                     sil_dur = get_duration(norm_path)
                     cmd_sil = [
                         "ffmpeg", "-y", "-nostdin",
                         "-i", norm_path,
-                        "-f", "lavfi", "-t", str(sil_dur), "-i", "anullsrc=r=44100:cl=stereo",
-                        "-map", "0:v",
+                        "-f", "lavfi", "-t", str(sil_dur),
+                        "-i", f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=stereo",
+                        "-map", "0:v:0",
                         "-map", "1:a",
                         "-c:v", "copy",
                         "-c:a", "aac", "-b:a", "128k",
-                        "-ar", "44100", "-ac", "2",
+                        "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
                         "-shortest",
                         silent_out
                     ]
                     run_ffmpeg(cmd_sil)
                     narrated.append(silent_out)
                 else:
+                    # Image-to-video, no narration: use normalized clip as-is
                     narrated.append(norm_path)
         normalized = narrated
         logger.info(f"Narration merged into {sum(1 for p in narration_paths if p)} clips")
 
-    # Step 3 — concatenate clips
+    # Step 3 — concatenate clips using DEMUXER CONCAT (not filter_complex!)
+    # This is the most robust approach:
+    # - No filtergraph strictness whatsoever
+    # - Ultra-fast (stream copy, no re-encoding)
+    # - Guaranteed to work as long as all clips have identical codec parameters
+    #   (which we ensured in steps 1 and 2)
     n = len(normalized)
     temp_concat = os.path.join(tmp_dir, "concat_temp.mp4")
-    
+
     if n == 1:
         shutil.copy(normalized[0], temp_concat)
         logger.info("Single clip, no concatenation needed")
     else:
-        # Build filter_complex for concatenation
-        # IMPORTANT: concat filter requires INTERLEAVED order: [v0][a0][v1][a1]...[vN][aN]
-        # NOT grouped: [v0][v1]...[a0][a1]...
-        filter_complex = (
-            "".join([f"[{i}:v][{i}:a]" for i in range(n)]) +
-            f"concat=n={n}:v=1:a=1[outv][outa]"
-        )
-        
-        cmd = ["ffmpeg", "-y", "-nostdin"]
-        for clip in normalized:
-            cmd.extend(["-i", clip])
-        cmd.extend([
-            "-filter_complex", filter_complex,
-            "-map", "[outv]",
-            "-map", "[outa]",
-            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-            "-c:a", "aac", "-b:a", "192k",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            temp_concat
-        ])
-        run_ffmpeg(cmd)
-        logger.info(f"Concatenated {n} clips into single stream")
+        # Write concat demuxer list file
+        concat_list_path = os.path.join(tmp_dir, "concat_list.txt")
+        with open(concat_list_path, "w") as f:
+            for clip in normalized:
+                # FFmpeg requires escaped paths in concat list
+                escaped = clip.replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
 
-    # Step 4 — optional watermark
-    final_path = temp_concat
+        cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_list_path,
+            "-c", "copy",  # stream copy — no re-encoding needed
+            "-movflags", "+faststart",
+            temp_concat
+        ]
+        run_ffmpeg(cmd)
+        logger.info(f"Concatenated {n} clips via demuxer concat (stream copy)")
+
+    # Step 4 — optional watermark overlay
     if watermark and FONT_FILE:
         logger.info(f"Adding watermark: {watermark}")
         safe_text = watermark.replace("'", "\\'").replace(":", "\\:")
-        
+
         char_count = len(watermark)
         if char_count <= 8:
             fontsize = 32
@@ -318,52 +343,69 @@ def process(
             fontsize = int(32 - (char_count - 8))
         else:
             fontsize = max(14, int(20 - (char_count - 20) * 0.5))
-        
+
         cmd = [
             "ffmpeg", "-y", "-nostdin",
             "-i", temp_concat,
-            "-vf", f"drawtext=text='{safe_text}':fontfile={FONT_FILE}:fontsize={fontsize}:fontcolor=white@0.85:x='max(10,w-tw-20)':y='h-th-20':shadowcolor=black@0.7:shadowx=2:shadowy=2",
+            "-vf", (
+                f"drawtext=text='{safe_text}'"
+                f":fontfile={FONT_FILE}"
+                f":fontsize={fontsize}"
+                f":fontcolor=white@0.85"
+                f":x='max(10,w-tw-20)'"
+                f":y='h-th-20'"
+                f":shadowcolor=black@0.7"
+                f":shadowx=2:shadowy=2"
+            ),
             "-c:a", "copy",
             output_path
         ]
         run_ffmpeg(cmd)
-        final_path = output_path
+        # Remove temp_concat since we wrote output_path above
+        try:
+            os.remove(temp_concat)
+        except OSError:
+            pass
     elif watermark and not FONT_FILE:
-        logger.warning(f"No font file found for watermark '{watermark}', skipping")
+        logger.warning(f"No font file found for watermark — skipping")
         shutil.move(temp_concat, output_path)
-        final_path = output_path
     else:
         shutil.move(temp_concat, output_path)
-        final_path = output_path
 
     # Step 5 — optional background audio merge
     if audio_path and os.path.isfile(audio_path):
         logger.info("Merging background audio...")
         video_duration = get_duration(output_path)
-        
+
+        # Trim and normalize background audio
         bg_trimmed = os.path.join(tmp_dir, "bg_trimmed.m4a")
         cmd = [
             "ffmpeg", "-y", "-nostdin",
             "-i", audio_path,
             "-t", str(video_duration),
-            "-af", "aformat=channel_layouts=stereo,volume=0.3",
+            "-af", f"aformat=sample_rates={AUDIO_SAMPLE_RATE}:channel_layouts=stereo,volume=0.3",
             "-c:a", "aac", "-b:a", "192k",
-            "-ar", "44100",
+            "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
             bg_trimmed
         ]
         run_ffmpeg(cmd)
-        
+
         temp_with_bg = os.path.join(tmp_dir, "with_bg.mp4")
+        af = (
+            f"[0:a]aformat=sample_rates={AUDIO_SAMPLE_RATE}:channel_layouts=stereo[a0];"
+            f"[1:a]aformat=sample_rates={AUDIO_SAMPLE_RATE}:channel_layouts=stereo[a1];"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[mixed]"
+        )
         cmd = [
             "ffmpeg", "-y", "-nostdin",
             "-i", output_path,
             "-i", bg_trimmed,
-            "-filter_complex", "[0:a]aformat=sample_rates=44100:channel_layouts=stereo[a0];[1:a]aformat=sample_rates=44100:channel_layouts=stereo[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[mixed]",
+            "-filter_complex", af,
             "-map", "0:v",
             "-map", "[mixed]",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
-            "-ar", "44100", "-ac", "2",
+            "-ar", str(AUDIO_SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS),
             temp_with_bg
         ]
         run_ffmpeg(cmd)
@@ -423,19 +465,6 @@ def self_test() -> None:
             raise RuntimeError("ffmpeg binary returned non-zero exit code")
         first_line = result.stdout.splitlines()[0] if result.stdout else "(no output)"
         logger.info(f"ffmpeg binary: {first_line}")
-        
-        # Check for required codecs
-        result = subprocess.run(
-            ["ffmpeg", "-formats"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if "EAAC" in result.stdout or "aac" in result.stdout.lower():
-            logger.info("AAC codec: available")
-        else:
-            logger.warning("AAC codec may not be fully available")
-            
     except FileNotFoundError:
         logger.error("ffmpeg binary not found in PATH")
         sys.exit(1)
