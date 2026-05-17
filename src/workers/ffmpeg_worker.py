@@ -398,6 +398,11 @@ def process(
     else:
         # Build xfade chain programmatically
         durations = [get_duration(p) for p in normalized]
+        # Log duration mismatches that could cause acrossfade failures
+        for i in range(len(durations) - 1):
+            diff = abs(durations[i] - durations[i+1])
+            if diff > 1.0:
+                logger.warning(f"Duration mismatch scene {i} vs {i+1}: {durations[i]:.2f}s vs {durations[i+1]:.2f}s (diff={diff:.2f}s) - may cause acrossfade issues")
         offset = 0.0
         video_stream = inputs[0].video
         audio_stream = inputs[0].audio.filter("aformat", channel_layouts="stereo")
@@ -424,6 +429,7 @@ def process(
                 offset=round(offset, 4),
             )
             next_audio = inputs[i].audio.filter("aformat", channel_layouts="stereo")
+            logger.info(f"acrossfade loop {i}: prev_dur={durations[i-1]}, next_dur={durations[i]}, td={td}, offset={round(offset,4)}")
             audio_stream = ffmpeg.filter(
                 [audio_stream, next_audio],
                 "acrossfade",
